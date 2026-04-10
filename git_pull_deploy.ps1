@@ -96,7 +96,7 @@ fi
 systemctl restart $ServiceName
 sleep 2
 systemctl is-active $ServiceName
-curl -fsS http://127.0.0.1:8000/healthz
+/root/feishu-bot/.venv/bin/python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=5).read().decode())"
 "@
 $remoteScript = $remoteScript -replace "`r`n", "`n"
 
