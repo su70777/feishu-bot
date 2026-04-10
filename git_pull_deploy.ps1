@@ -64,7 +64,8 @@ if (-not $KeyPath) {
     throw "No SSH key found. Set -KeyPath or FEISHU_BOT_SSH_KEY."
 }
 
-$sshCommand = "ssh -i `"$KeyPath`" -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+$normalizedKeyPath = ($KeyPath -replace "\\", "/")
+$sshCommand = "ssh -i '$normalizedKeyPath' -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 git config core.sshCommand $sshCommand | Out-Null
 
 if ($AutoCommit) {
@@ -97,6 +98,7 @@ sleep 2
 systemctl is-active $ServiceName
 curl -fsS http://127.0.0.1:8000/healthz
 "@
+$remoteScript = $remoteScript -replace "`r`n", "`n"
 
 Run-NativeChecked -Name "remote deploy" -Action {
     $remoteScript | & ssh -i $KeyPath -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new $remoteTarget "bash -s"
