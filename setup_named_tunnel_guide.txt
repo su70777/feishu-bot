@@ -1,0 +1,63 @@
+固定地址方案（Cloudflare Named Tunnel）
+
+目标：
+把现在会变化的 trycloudflare 临时地址，
+改成固定地址，例如：
+https://feishu-bot.yourdomain.com/feishu/events
+
+你需要准备：
+1. 一个 Cloudflare 账号
+2. 一个你自己的域名（并托管到 Cloudflare）
+
+推荐固定地址：
+feishu-bot.yourdomain.com
+
+一、登录 Cloudflare
+1. 打开：dash.cloudflare.com
+2. 登录你的账号
+3. 把你的域名接入 Cloudflare
+
+二、在本机执行（PowerShell）
+1. 登录 cloudflared
+cloudflared tunnel login
+
+2. 创建固定隧道
+cloudflared tunnel create feishu-bot
+
+执行后会得到一个 Tunnel ID，
+并在：
+C:\Users\Administrator\.cloudflared\
+下面生成一个 json 凭证文件。
+
+3. 创建固定域名路由
+cloudflared tunnel route dns feishu-bot feishu-bot.yourdomain.com
+
+三、写配置文件
+1. 把项目里的：
+cloudflared_named_tunnel_config.example.yml
+复制一份为：
+C:\Users\Administrator\.cloudflared\config.yml
+
+2. 把里面这三项改成真实值：
+- YOUR_TUNNEL_ID
+- 凭证 json 路径
+- feishu-bot.yourdomain.com
+
+四、启动固定隧道
+cloudflared tunnel run feishu-bot
+
+五、飞书后台固定填写
+事件配置地址：
+https://feishu-bot.yourdomain.com/feishu/events
+
+六、以后怎么启动
+1. 启动机器人后端
+python -m uvicorn app:app --host 127.0.0.1 --port 8000
+
+2. 启动固定隧道
+cloudflared tunnel run feishu-bot
+
+说明：
+这套方式和 trycloudflare 不一样。
+只要你的域名和 Tunnel 不变，
+飞书后台地址就一直不需要改。

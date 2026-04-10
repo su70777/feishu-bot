@@ -1,0 +1,15 @@
+[Unit]
+Description=Feishu Enrollment Bot
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/feishu-bot
+ExecStart=/opt/feishu-bot/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
