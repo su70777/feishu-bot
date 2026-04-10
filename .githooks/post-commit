@@ -1,0 +1,33 @@
+#!/usr/bin/env sh
+set -u
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+LOG_FILE="$ROOT/.git/auto_deploy.log"
+
+# Allow manual skip when needed:
+#   set FEISHU_SKIP_AUTO_DEPLOY=1
+if [ "${FEISHU_SKIP_AUTO_DEPLOY:-0}" = "1" ]; then
+  exit 0
+fi
+
+BRANCH="$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo '')"
+if [ "$BRANCH" != "main" ]; then
+  printf '%s [post-commit] skip deploy on branch: %s\n' "$(date '+%F %T')" "$BRANCH" >> "$LOG_FILE"
+  exit 0
+fi
+
+if ! command -v powershell.exe >/dev/null 2>&1; then
+  printf '%s [post-commit] skip deploy: powershell.exe not found\n' "$(date '+%F %T')" >> "$LOG_FILE"
+  exit 0
+fi
+
+printf '%s [post-commit] deploy start\n' "$(date '+%F %T')" >> "$LOG_FILE"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$ROOT/git_pull_deploy.ps1" -NoPause >> "$LOG_FILE" 2>&1
+if [ $? -ne 0 ]; then
+  printf '%s [post-commit] deploy failed (check log above)\n' "$(date '+%F %T')" >> "$LOG_FILE"
+  exit 0
+fi
+
+printf '%s [post-commit] deploy done\n' "$(date '+%F %T')" >> "$LOG_FILE"
+exit 0
+
