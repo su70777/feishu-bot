@@ -49,13 +49,18 @@ MANAGE_SESSION_MAX_AGE = 7 * 24 * 3600
 
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 FEISHU_AUTH_BASE = "https://accounts.feishu.cn/open-apis/authen/v1"
+BOT_BUILD = "2026-04-15.4"
 
 
 def _read_json(path: Path, default: Any) -> Any:
     if not path.exists():
         return default
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        # 容错：JSON 文件损坏时不让主流程中断，避免机器人“发了没反应”。
+        return default
 
 
 def _write_json(path: Path, payload: Any) -> None:
@@ -308,7 +313,8 @@ def _is_valid_open_id(value: str) -> bool:
     if not value:
         return False
     v = value.strip()
-    if not v.startswith("ou_"):
+    # 飞书 open_id 只允许字母数字下划线，且长度应明显大于示例值。
+    if not re.fullmatch(r"ou_[A-Za-z0-9_]{10,}", v):
         return False
     return v.lower() not in {"ou_xxx", "ou_demo", "ou_test"}
 
@@ -345,7 +351,9 @@ def _consume_recent_command_once(sender_open_id: str, chat_id: str, text: str, w
             ts_value = float(ts)
         except (TypeError, ValueError):
             continue
-        if now_ts - ts_value <= window_seconds:
+        # 仅保留“过去 window_seconds 秒内”的记录；
+        # 若出现未来时间戳（例如服务器时间回拨/漂移），直接丢弃，避免长期误判重复。
+        if 0 <= now_ts - ts_value <= window_seconds:
             valid_rows[k] = ts_value
 
     last_ts = valid_rows.get(key)
@@ -882,13 +890,28 @@ def _save_roster(roster: dict[str, str]) -> None:
 
 def _load_authorized_users() -> dict[str, str]:
     raw = _read_json(AUTHORIZED_USER_FILE, {})
-    if not isinstance(raw, dict):
-        return {}
     rows: dict[str, str] = {}
-    for open_id, name in raw.items():
-        oid = str(open_id).strip()
-        if oid:
-            rows[oid] = str(name).strip()
+    # 兼容历史格式：
+    # 1) {"ou_xxx": "张三"}
+    # 2) [{"open_id": "ou_xxx", "name": "张三"}]
+    if isinstance(raw, dict):
+        for open_id, name in raw.items():
+            oid = str(open_id).strip()
+            if oid:
+                rows[oid] = str(name).strip()
+    elif isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            oid = str(item.get("open_id") or "").strip()
+            if not oid:
+                continue
+            rows[oid] = str(item.get("name") or "").strip()
+
+    # 主管理员永远保留权限（不可丢失）
+    teacher_id = (SETTINGS.teacher_open_id or "").strip()
+    if _is_valid_open_id(teacher_id):
+        rows.setdefault(teacher_id, _resolve_name_by_open_id(teacher_id) or "主管理员")
     return rows
 
 
@@ -898,6 +921,10 @@ def _save_authorized_users(rows: dict[str, str]) -> None:
         oid = str(open_id).strip()
         if oid:
             normalized[oid] = str(name).strip()
+    # 强制保留主管理员权限，避免误删后失去管理能力
+    teacher_id = (SETTINGS.teacher_open_id or "").strip()
+    if _is_valid_open_id(teacher_id):
+        normalized.setdefault(teacher_id, _resolve_name_by_open_id(teacher_id) or "主管理员")
     _write_json(AUTHORIZED_USER_FILE, normalized)
 
 
@@ -927,9 +954,11 @@ def _resolve_name_by_open_id(open_id: str) -> str:
     for row in org_rows:
         if isinstance(row, dict) and (row.get("open_id") or "").strip() == open_id:
             return (row.get("name") or "").strip()
-    name = _name_by_open_id(open_id)
-    if name:
-        return name
+    # 兜底：再从本地 roster 查一次，避免与 _name_by_open_id 相互调用形成递归。
+    roster = _load_roster()
+    for name, oid in roster.items():
+        if (oid or "").strip() == (open_id or "").strip() and (name or "").strip():
+            return (name or "").strip()
     return ""
 
 
@@ -951,6 +980,9 @@ def _grant_authorized_user(open_id: str, display_name: str = "") -> None:
 
 
 def _revoke_authorized_user(open_id: str) -> bool:
+    # 主管理员权限不可移除
+    if _is_super_admin(open_id):
+        return False
     rows = _load_authorized_users()
     if open_id not in rows:
         return False
@@ -1154,13 +1186,14 @@ def _is_super_admin_command(text: str) -> bool:
         "授权接收预警 ",
         "移除预警接收 ",
     ]
-    exacts = {"查看可用人员", "查看授权人员", "查看使用权限", "查看预警接收人", "查看预警权限"}
-    return text in exacts or any(text.startswith(p) for p in prefixes)
+    return any(text.startswith(p) for p in prefixes)
 
 
 def _is_manager_command(text: str) -> bool:
     if _is_registration_command(text) or _is_help_command(text):
         return False
+    if text in {"查看可用人员", "查看授权人员", "查看使用权限", "查看预警接收人", "查看预警权限"}:
+        return True
     if text in {"开启自动回复", "关闭自动回复", "自动回复状态", "开启忙碌模式", "关闭忙碌模式"}:
         return True
     if text.startswith("设置自动回复时间 "):
@@ -2736,10 +2769,18 @@ def feishu_events(payload: EventEnvelope) -> dict[str, Any]:
                 "text": text,
             }
         )
-        return {"ok": True, "ignored": "duplicate_command"}
+        ret = _reply_chat(chat_id, "检测到重复命令：8秒内相同文本会自动去重，请稍后重试。")
+        return {"ok": True, "ignored": "duplicate_command", "send_result": ret}
 
     if _is_super_admin_command(text) and not _is_super_admin(sender_open_id):
-        ret = _reply_chat(chat_id, "你暂无权限管理可用人员。只有主管理员可以授权或移除使用权限。")
+        teacher_oid = (SETTINGS.teacher_open_id or "").strip()
+        if not _is_valid_open_id(teacher_oid):
+            ret = _reply_chat(
+                chat_id,
+                "你暂无权限管理可用人员。当前主管理员配置异常（TEACHER_OPEN_ID 无效），请联系维护人员在 .env 中改为完整 ou_ 开头ID（不能带...）。",
+            )
+        else:
+            ret = _reply_chat(chat_id, "你暂无权限管理可用人员。只有主管理员可以授权或移除使用权限。")
         return {"ok": True, "mode": "super_admin_denied", "send_result": ret}
 
     if _is_manager_command(text) and not _is_authorized_user(sender_open_id):
@@ -2882,12 +2923,13 @@ def feishu_events(payload: EventEnvelope) -> dict[str, Any]:
             "2) 查看可用人员\n"
             "3) 查看成员 雷炫 / 查看人员 雷炫\n"
             "4) 管理页 / 打开管理页\n"
-            "5) 上传名单文件后：文件建标签 自考\n"
-            "6) 复用群发 自考 今晚20:00上课提醒\n"
-            "7) 群标签群发 A组 今晚20:00上课提醒\n"
-            "8) 授权使用 张三\n"
-            "9) 移除使用权限 张三\n"
-            "10) 授权接收预警 张三 / 移除预警接收 张三\n"
+            "5) 我的身份 / 版本\n"
+            "6) 上传名单文件后：文件建标签 自考\n"
+            "7) 复用群发 自考 今晚20:00上课提醒\n"
+            "8) 群标签群发 A组 今晚20:00上课提醒\n"
+            "9) 授权使用 张三\n"
+            "10) 移除使用权限 张三\n"
+            "11) 授权接收预警 张三 / 移除预警接收 张三\n"
             "\n"
             "说明：\n"
             "先把 txt/csv/xlsx 名单文件发给机器人，再发：文件建标签 自考\n"
@@ -2895,6 +2937,7 @@ def feishu_events(payload: EventEnvelope) -> dict[str, Any]:
             "查看成员/查看人员 雷炫：显示该成员完整 open_id，方便你做授权。\n"
             "复用群发格式：复用群发 自考 今晚20:00上课提醒\n"
             "复用群发会优先按模板名发送；如果没有同名模板，就按学生标签发送。\n"
+            "主管理员权限默认保留，不会因授权他人而丢失。\n"
             "授权使用/移除使用权限优先按姓名匹配；如果重名，再用：授权使用 张三 ou_xxx\n"
             "授权接收预警/移除预警接收优先按姓名匹配；如果重名，再用：授权接收预警 张三 ou_xxx"
         )
@@ -2910,13 +2953,39 @@ def feishu_events(payload: EventEnvelope) -> dict[str, Any]:
         ret = _reply_chat(chat_id, f"管理页地址：{url}\n打开后会先进行飞书登录，登录完成即可查看标签、授权人员和发送记录。")
         return {"ok": True, "mode": "manage_page", "send_result": ret}
 
+    if text in {"版本", "ver", "version"}:
+        teacher_oid = (SETTINGS.teacher_open_id or "").strip()
+        teacher_show = teacher_oid if not teacher_oid else f"{teacher_oid[:12]}...{teacher_oid[-6:]}"
+        ret = _reply_chat(
+            chat_id,
+            f"当前版本：{BOT_BUILD}\n"
+            f"主管理员ID：{teacher_show}\n"
+            "如果你刚更新过代码但版本没变，说明服务器还在旧代码。",
+        )
+        return {"ok": True, "mode": "version", "send_result": ret}
+
+    if text in {"我的身份", "我的权限", "whoami"}:
+        is_super = _is_super_admin(sender_open_id)
+        is_auth = _is_authorized_user(sender_open_id)
+        ret = _reply_chat(
+            chat_id,
+            f"你的 open_id：{sender_open_id}\n"
+            f"主管理员：{'是' if is_super else '否'}\n"
+            f"管理权限：{'有' if is_auth else '无'}",
+        )
+        return {"ok": True, "mode": "whoami", "send_result": ret}
+
 
     if text in {"查看可用人员", "查看授权人员", "查看使用权限"}:
         rows = _load_authorized_users()
-        if not rows:
-            ret = _reply_chat(chat_id, "当前还没有额外授权人员。默认只有主管理员可使用管理功能。")
+        teacher_oid = (SETTINGS.teacher_open_id or "").strip()
+        lines = []
+        for open_id, name in rows.items():
+            suffix = "（主管理员）" if teacher_oid and open_id == teacher_oid else ""
+            lines.append(f"{name or open_id} -> {open_id[:12]}...{suffix}")
+        if not lines:
+            ret = _reply_chat(chat_id, "当前还没有可用人员。请先检查 .env 中 TEACHER_OPEN_ID 是否配置正确。")
             return {"ok": True, "mode": "show_authorized_users", "send_result": ret}
-        lines = [f"{name or open_id} -> {open_id[:12]}..." for open_id, name in rows.items()]
         ret = _reply_chat(chat_id, "当前可用人员：\n" + "\n".join(lines))
         return {"ok": True, "mode": "show_authorized_users", "send_result": ret}
 
@@ -2968,6 +3037,9 @@ def feishu_events(payload: EventEnvelope) -> dict[str, Any]:
         target_open_id, display_name = _resolve_authorize_target(body, message.get("mentions", []))
         if not _is_valid_open_id(target_open_id):
             ret = _reply_chat(chat_id, "格式错误，请使用：移除使用权限 张三 ou_xxx，或在群里@对方后发送：移除使用权限 张三")
+            return {"ok": True, "mode": "revoke_authorized_user", "send_result": ret}
+        if _is_super_admin(target_open_id):
+            ret = _reply_chat(chat_id, "主管理员权限不可移除。")
             return {"ok": True, "mode": "revoke_authorized_user", "send_result": ret}
         ok = _revoke_authorized_user(target_open_id)
         if not ok:
