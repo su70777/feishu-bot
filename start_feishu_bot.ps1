@@ -1,9 +1,10 @@
 param(
-    [switch]$NoPause
+    [switch]$NoPause,
+    [int]$Port = 8000
 )
 
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$AppUrl = "http://127.0.0.1:8000"
+$AppUrl = "http://127.0.0.1:$Port"
 $UvicornOut = Join-Path $ProjectDir "uvicorn_stdout.log"
 $UvicornErr = Join-Path $ProjectDir "uvicorn_stderr.log"
 $TunnelOut = Join-Path $ProjectDir "cloudflared_stdout.log"
@@ -19,15 +20,30 @@ if (-not (Test-Path $CloudflaredExe)) {
 
 Write-Host "Starting Feishu bot service..."
 $uvicorn = Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -eq "python.exe" -and $_.CommandLine -like "*uvicorn app:app*8000*"
+    $_.Name -eq "python.exe" -and $_.CommandLine -like "*uvicorn app:app*--port*$Port*"
 } | Select-Object -First 1
 
 if (-not $uvicorn) {
+    $listener = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) {
+        $owner = Get-CimInstance Win32_Process -Filter "ProcessId=$($listener.OwningProcess)" -ErrorAction SilentlyContinue
+        Write-Host "Port $Port is already in use, so the Feishu bot cannot start on $AppUrl."
+        if ($owner) {
+            Write-Host "Port owner PID: $($owner.ProcessId)"
+            Write-Host "Port owner command: $($owner.CommandLine)"
+        }
+        Write-Host "Stop the service using that port, or start this bot with another port:"
+        Write-Host "powershell -ExecutionPolicy Bypass -File `"$ProjectDir\start_feishu_bot.ps1`" -Port 8001"
+        if (-not $NoPause) { Pause }
+        exit 1
+    }
+
     Start-Process python `
         -WorkingDirectory $ProjectDir `
-        -ArgumentList "-m","uvicorn","app:app","--host","127.0.0.1","--port","8000" `
+        -ArgumentList "-m","uvicorn","app:app","--host","127.0.0.1","--port",$Port `
         -RedirectStandardOutput $UvicornOut `
-        -RedirectStandardError $UvicornErr | Out-Null
+        -RedirectStandardError $UvicornErr `
+        -WindowStyle Hidden | Out-Null
 }
 
 try {
@@ -42,6 +58,10 @@ try {
     }
     if (-not $health) {
         throw "health check failed"
+    }
+    $healthJson = $health.Content | ConvertFrom-Json
+    if (-not $healthJson.ok) {
+        throw "health check did not return Feishu bot status"
     }
     Write-Host $health.Content
 } catch {
@@ -58,14 +78,15 @@ if (-not (Test-Path $CloudflaredExe)) {
 }
 
 $cloudflared = Get-CimInstance Win32_Process | Where-Object {
-    $_.Name -eq "cloudflared.exe" -and $_.CommandLine -like "*127.0.0.1:8000*"
+    $_.Name -eq "cloudflared.exe" -and $_.CommandLine -like "*127.0.0.1:$Port*"
 } | Select-Object -First 1
 
 if (-not $cloudflared) {
     Start-Process $CloudflaredExe `
         -ArgumentList "tunnel","--url",$AppUrl `
         -RedirectStandardOutput $TunnelOut `
-        -RedirectStandardError $TunnelErr | Out-Null
+        -RedirectStandardError $TunnelErr `
+        -WindowStyle Hidden | Out-Null
     Start-Sleep -Seconds 5
 }
 

@@ -3,9 +3,17 @@ set -euo pipefail
 
 APP_DIR="${APP_DIR:-/opt/feishu-bot}"
 APP_DOMAIN="${APP_DOMAIN:-lmf.hszk365.cn}"
+APP_PATH="${APP_PATH:-/feishu-bot}"
+APP_PORT="${APP_PORT:-18080}"
+SERVICE_NAME="${SERVICE_NAME:-feishu-bot}"
+NGINX_SNIPPET="${NGINX_SNIPPET:-/etc/nginx/snippets/${SERVICE_NAME}-locations.conf}"
 APP_USER="${APP_USER:-${SUDO_USER:-$USER}}"
 APP_GROUP="${APP_GROUP:-$APP_USER}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
+
+APP_PATH="/${APP_PATH#/}"
+APP_PATH="${APP_PATH%/}"
+PUBLIC_BASE_URL="${PUBLIC_BASE_URL:-https://${APP_DOMAIN}${APP_PATH}}"
 
 echo "[1/8] Installing system packages..."
 sudo apt update
@@ -24,8 +32,20 @@ echo "[4/8] Ensuring writable runtime directories..."
 mkdir -p "${APP_DIR}/data"
 touch "${APP_DIR}/data/.keep"
 
-echo "[5/8] Installing systemd service..."
-sudo tee /etc/systemd/system/feishu-bot.service >/dev/null <<EOF
+echo "[5/8] Updating PUBLIC_BASE_URL..."
+if [ -f "${APP_DIR}/.env" ]; then
+    if grep -q '^PUBLIC_BASE_URL=' "${APP_DIR}/.env"; then
+        sed -i.bak "s|^PUBLIC_BASE_URL=.*|PUBLIC_BASE_URL=${PUBLIC_BASE_URL}|" "${APP_DIR}/.env"
+    else
+        printf '\nPUBLIC_BASE_URL=%s\n' "${PUBLIC_BASE_URL}" >> "${APP_DIR}/.env"
+    fi
+else
+    printf 'PUBLIC_BASE_URL=%s\n' "${PUBLIC_BASE_URL}" > "${APP_DIR}/.env"
+    echo "Created ${APP_DIR}/.env with PUBLIC_BASE_URL only. Add Feishu credentials before production use."
+fi
+
+echo "[6/8] Installing systemd service..."
+sudo tee "/etc/systemd/system/${SERVICE_NAME}.service" >/dev/null <<EOF
 [Unit]
 Description=Feishu Enrollment Bot
 After=network.target
@@ -35,7 +55,7 @@ Type=simple
 User=${APP_USER}
 Group=${APP_GROUP}
 WorkingDirectory=${APP_DIR}
-ExecStart=${APP_DIR}/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port 8000
+ExecStart=${APP_DIR}/.venv/bin/python -m uvicorn app:app --host 127.0.0.1 --port ${APP_PORT}
 Restart=always
 RestartSec=5
 Environment=PYTHONUNBUFFERED=1
@@ -45,39 +65,42 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable feishu-bot
-sudo systemctl restart feishu-bot
+sudo systemctl enable "${SERVICE_NAME}"
+sudo systemctl restart "${SERVICE_NAME}"
 
-echo "[6/8] Installing nginx config..."
-sudo tee /etc/nginx/sites-available/feishu-bot.conf >/dev/null <<EOF
-server {
-    listen 80;
-    server_name ${APP_DOMAIN};
+echo "[7/8] Writing nginx location snippet..."
+sudo mkdir -p "$(dirname "${NGINX_SNIPPET}")"
+sudo tee "${NGINX_SNIPPET}" >/dev/null <<EOF
+location = ${APP_PATH} {
+    return 301 ${APP_PATH}/;
+}
 
-    client_max_body_size 20m;
-
-    location / {
-        proxy_pass http://127.0.0.1:8000;
-        proxy_http_version 1.1;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto \$scheme;
-    }
+location ^~ ${APP_PATH}/ {
+    proxy_pass http://127.0.0.1:${APP_PORT}/;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto \$scheme;
 }
 EOF
 
-sudo ln -sf /etc/nginx/sites-available/feishu-bot.conf /etc/nginx/sites-enabled/feishu-bot.conf
-sudo rm -f /etc/nginx/sites-enabled/default
-sudo nginx -t
-sudo systemctl reload nginx
+if sudo grep -Rqs "$(basename "${NGINX_SNIPPET}")" /etc/nginx/sites-enabled /etc/nginx/conf.d 2>/dev/null; then
+    sudo nginx -t
+    sudo systemctl reload nginx
+else
+    echo "Nginx snippet was written but not enabled yet."
+    echo "Add this line inside the existing server block for ${APP_DOMAIN}:"
+    echo "    include ${NGINX_SNIPPET};"
+    echo "Then run: sudo nginx -t && sudo systemctl reload nginx"
+fi
 
-echo "[7/8] Checking local service..."
-curl -fsS http://127.0.0.1:8000/healthz || true
+echo "[8/8] Checking local service..."
+curl -fsS "http://127.0.0.1:${APP_PORT}/healthz" || true
 
-echo "[8/8] Done."
+echo "Done."
 echo "Next steps:"
-echo "  1. Point DNS of ${APP_DOMAIN} to this Ubuntu server."
-echo "  2. Run: sudo apt install -y certbot python3-certbot-nginx"
-echo "  3. Run: sudo certbot --nginx -d ${APP_DOMAIN}"
-echo "  4. In Feishu backend, set callback URL to: https://${APP_DOMAIN}/feishu/events"
+echo "  1. Ensure the existing ${APP_DOMAIN} nginx server block includes: include ${NGINX_SNIPPET};"
+echo "  2. Verify public health: https://${APP_DOMAIN}${APP_PATH}/healthz"
+echo "  3. In Feishu backend, set callback URL to: https://${APP_DOMAIN}${APP_PATH}/feishu/events"
+echo "  4. Set OAuth redirect URL to: https://${APP_DOMAIN}${APP_PATH}/auth/feishu/callback"
